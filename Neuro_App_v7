@@ -1,0 +1,570 @@
+# Causal Discovery & Inference App with SHAP-based CATE Exploration
+# ---------------------------------------------------------------
+# pip install streamlit pandas numpy networkx matplotlib seaborn pgmpy statsmodels econml shap dowhy pydot
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io, warnings, sys, math
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from pgmpy.estimators import PC
+from statsmodels.tsa.stattools import adfuller, grangercausalitytests
+from statsmodels.tsa.api import VAR
+from statsmodels.stats.multitest import multipletests
+
+from econml.dml import CausalForestDML, LinearDML, SparseLinearDML, KernelDML
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+from dowhy import CausalModel
+import pydot
+
+# try/soft import shap
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+
+# ----------------- GLOBALS -----------------
+warnings.filterwarnings("ignore")
+GLOBAL_SEED = 42
+np.random.seed(GLOBAL_SEED)
+
+st.set_page_config(layout="wide", page_title="Causal Discovery and Inference App")
+st.title("Causal Discovery and Inference with `EconML`, `DoWhy` — now with SHAP CATE exploration")
+st.markdown("Upload your data, explore correlation/causality, estimate causal effects, and explain **heterogeneous effects (CATE)** using **SHAP**.")
+st.divider()
+
+# ----------------- HELPERS & CACHING -----------------
+@st.cache_data(show_spinner=False)
+def _coerce_numeric(df: pd.DataFrame):
+    df_num = pd.DataFrame(index=df.index)
+    dropped = []
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            df_num[c] = df[c]
+        else:
+            x = pd.to_numeric(df[c], errors="coerce")
+            # keep column if at least half becomes numeric
+            if x.notna().sum() >= max(3, int(0.5 * len(x))):
+                df_num[c] = x
+            else:
+                dropped.append(c)
+    return df_num, dropped
+
+@st.cache_data(show_spinner=False)
+def _standardize(df: pd.DataFrame):
+    scaler = StandardScaler()
+    z = pd.DataFrame(scaler.fit_transform(df.values), columns=df.columns, index=df.index)
+    return z
+
+def _validate_time_index(df: pd.DataFrame):
+    msgs = []
+    ok = True
+    if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        msgs.append("Index is not datetime/period; Granger/DBN will assume evenly-spaced rows.")
+        ok = False
+    else:
+        if not df.index.is_monotonic_increasing:
+            msgs.append("Datetime index not sorted; sorting by time.")
+        if df.index.inferred_freq is None:
+            msgs.append("Datetime frequency not inferred; ensure roughly even spacing for Granger/DBN.")
+    return ok, msgs
+
+@st.cache_data(show_spinner=False)
+def compute_corr(df: pd.DataFrame):
+    return df.corr(numeric_only=True)
+
+@st.cache_data(show_spinner=False)
+def compute_adf_stationary(df: pd.DataFrame, alpha: float):
+    transformed, info = {}, {}
+    for c in df.columns:
+        s = df[c].dropna()
+        if len(s) < 3:
+            continue
+        n_diffs = 0
+        while True:
+            try:
+                p = adfuller(s)[1]
+            except Exception:
+                break
+            if p <= alpha or n_diffs >= 2 or len(s) < 3:
+                transformed[c] = s
+                info[c] = n_diffs
+                break
+            s = s.diff().dropna()
+            n_diffs += 1
+    if not transformed:
+        return pd.DataFrame(index=df.index), {}
+    out = pd.concat(transformed, axis=1).dropna()
+    return out, info
+
+@st.cache_data(show_spinner=False)
+def pc_estimate(df: pd.DataFrame, alpha: float, ci_test: str):
+    est = PC(data=df)
+    model = est.estimate(ci_test=ci_test, significance_level=alpha)
+    dag = nx.DiGraph(model.edges())
+    return dag, {'num_nodes': dag.number_of_nodes(),
+                 'num_edges': dag.number_of_edges(),
+                 'edges': list(dag.edges())}
+
+@st.cache_data(show_spinner=False)
+def dbn_estimate(df: pd.DataFrame, max_lag: int, alpha: float, ci_test: str):
+    lagged = df.copy()
+    for lag in range(1, max_lag + 1):
+        for c in df.columns:
+            lagged[f"{c}_t-{lag}"] = df[c].shift(lag)
+    lagged = lagged.add_suffix("_t").dropna()
+    est = PC(data=lagged)
+    model = est.estimate(ci_test=ci_test, significance_level=alpha)
+    dag = nx.DiGraph(model.edges())
+    return dag, {'num_nodes': dag.number_of_nodes(),
+                 'num_edges': dag.number_of_edges(),
+                 'max_lag': max_lag,
+                 'edges': list(dag.edges())}
+
+def _graph_layout(dag: nx.DiGraph):
+    try:
+        from networkx.drawing.nx_pydot import graphviz_layout
+        return graphviz_layout(dag, prog="dot")
+    except Exception:
+        return nx.spring_layout(dag, k=0.8, iterations=50, seed=GLOBAL_SEED)
+
+@st.cache_data(show_spinner=False)
+def auto_select_lag(df: pd.DataFrame, max_lag_cap: int = 12, criterion: str = "aic"):
+    try:
+        model = VAR(df.dropna())
+        res = model.select_order(maxlags=min(max_lag_cap, max(1, int(len(df) / 5))))
+        k = getattr(res, criterion)
+        if k is None or (isinstance(k, float) and math.isnan(k)):
+            return 3
+        return int(k)
+    except Exception:
+        return 3
+
+@st.cache_data(show_spinner=False)
+def granger_matrix(df: pd.DataFrame, max_lag: int, alpha: float, fdr: bool = True):
+    cols = df.select_dtypes("number").columns.tolist()
+    results = []
+    for i, cause in enumerate(cols):
+        for j, effect in enumerate(cols):
+            if i == j:
+                continue
+            data = df[[effect, cause]].dropna()
+            if len(data) <= max_lag:
+                continue
+            try:
+                gc = grangercausalitytests(data, maxlag=max_lag, verbose=False)
+                p = gc[max_lag][0]['ssr_ftest'][1]
+                results.append((cause, effect, p))
+            except Exception:
+                continue
+    if not results:
+        return pd.DataFrame(columns=["cause", "effect", "p_raw", "p_adj", "significant"])
+    pvals = [r[2] for r in results]
+    if fdr and len(pvals) > 1:
+        rej, padj, _, _ = multipletests(pvals, alpha=alpha, method="fdr_bh")
+    else:
+        rej, padj = [p < alpha for p in pvals], pvals
+    out = pd.DataFrame({
+        "cause": [r[0] for r in results],
+        "effect": [r[1] for r in results],
+        "p_raw": pvals,
+        "p_adj": padj,
+        "significant": rej
+    }).sort_values("p_adj")
+    return out
+
+def plot_corr_heatmap(corr, title="Correlation Matrix"):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", linewidths=.5, ax=ax)
+    ax.set_title(title, fontsize=16)
+    plt.xticks(rotation=45, ha='right'); plt.yticks(rotation=0)
+    plt.tight_layout()
+    return fig
+
+def plot_dag(dag: nx.DiGraph, title: str):
+    if dag is None or dag.number_of_nodes() == 0: 
+        return None
+    pos = _graph_layout(dag)
+    degrees = dict(dag.degree())
+    mn, mx = (min(degrees.values()), max(degrees.values())) if degrees else (0, 0)
+    def _scale(d): 
+        return 500 + (0 if mx==mn else (d - mn)/(mx - mn) * 4500)
+    fig, ax = plt.subplots(figsize=(12, 8))
+    nx.draw_networkx_nodes(dag, pos, node_size=[_scale(degrees[n]) for n in dag.nodes()],
+                           node_color="lightblue", alpha=0.95, edgecolors="grey", ax=ax)
+    nx.draw_networkx_edges(dag, pos, width=1.8, edge_color="gray", arrowsize=18, alpha=0.8, ax=ax)
+    nx.draw_networkx_labels(dag, pos, font_size=10, font_weight="bold", ax=ax)
+    ax.set_title(title, fontsize=16); ax.axis("off"); plt.tight_layout()
+    return fig
+
+def df_download_button(df: pd.DataFrame, label: str, filename: str):
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(label=label, data=csv, file_name=filename, mime="text/csv")
+
+# ----------------- SIDEBAR -----------------
+with st.sidebar:
+    st.header("Upload and Settings")
+    uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
+
+    if uploaded_file:
+        st.subheader("Analysis Settings")
+        causality_alpha = st.slider("Significance Level (alpha)", 0.01, 0.1, 0.05, 0.01)
+        lag_mode = st.radio("Granger Lag", ["Auto (AIC)", "Manual"], horizontal=True)
+        granger_max_lag = st.slider("Manual Granger Max Lag", 1, 15, 3, 1, disabled=(lag_mode=="Auto (AIC)"))
+        dbn_max_lag = st.slider("DBN Max Lag", 1, 5, 2, 1)
+        corr_threshold = st.slider("Correlation Threshold", 0.0, 1.0, 0.1, 0.05)
+        ci_test = st.selectbox("PC/DBN CI test", ["pearsonr", "partial_correlation"], index=0)
+        zscore = st.toggle("Standardize features (z-score)", value=True,
+                           help="Recommended for correlation/PC to avoid scale effects.")
+    run_button = st.button("Run Analysis", use_container_width=True)
+
+# ----------------- MAIN -----------------
+if uploaded_file and run_button:
+    try:
+        # Robust CSV read
+        content = uploaded_file.read()
+        for enc in ("utf-8", "utf-16", "latin1"):
+            try:
+                df = pd.read_csv(io.BytesIO(content), encoding=enc)
+                break
+            except Exception:
+                continue
+        else:
+            st.error("Could not read CSV with tried encodings."); st.stop()
+
+        # Use first datetime-like column as index if present
+        dt_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c]) \
+                   or pd.to_datetime(df[c], errors="coerce").notna().mean() > 0.9]
+        if dt_cols:
+            c0 = dt_cols[0]
+            df[c0] = pd.to_datetime(df[c0], errors="coerce")
+            df = df.set_index(c0).sort_index()
+
+        df_num, dropped = _coerce_numeric(df)
+        if dropped:
+            st.warning(f"Dropping non-numeric/unusable columns: {', '.join(dropped)}")
+        if df_num.shape[1] < 2:
+            st.error("Need at least 2 numeric columns after preprocessing."); st.stop()
+
+        if zscore:
+            df_work = _standardize(df_num.fillna(method="ffill").fillna(method="bfill"))
+        else:
+            df_work = df_num.fillna(method="ffill").fillna(method="bfill")
+
+        ok, msgs = _validate_time_index(df_work)
+        for m in msgs: st.info(m)
+
+        with st.expander("Data Preprocessing & Overview", expanded=True):
+            st.write(f"Data loaded. Shape: **{df_work.shape}**")
+            st.dataframe(df_work.head())
+
+        st.divider()
+
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Correlation Analysis",
+            "Granger Causality",
+            "PC Algorithm Static Causal Graph",
+            "Dynamic Bayesian Network",
+            "Advanced Causal Inference (DoWhy, EconML + SHAP)"
+        ])
+
+        # ------------- Tab 1: Correlation -------------
+        with tab1:
+            st.header("Correlation Analysis")
+            corr = compute_corr(df_work)
+            fig_corr = plot_corr_heatmap(corr)
+            st.pyplot(fig_corr)
+            strong = (corr.where(~np.eye(len(corr), dtype=bool))
+                           .stack().reset_index())
+            strong.columns = ["var1","var2","corr"]
+            strong = strong[strong["corr"].abs() >= corr_threshold] \
+                     .sort_values("corr", ascending=False)
+            if strong.empty:
+                st.info("No correlations above threshold.")
+            else:
+                st.dataframe(strong, use_container_width=True, height=300)
+                df_download_button(strong, "Download correlations CSV", "correlations.csv")
+
+        # ------------- Tab 2: Granger -------------
+        stationary_df, diff_info = compute_adf_stationary(df_work, alpha=causality_alpha)
+        with tab2:
+            st.header("Granger Causality")
+            if stationary_df.empty:
+                st.error("Could not form stationary series for Granger.")
+            else:
+                if lag_mode == "Auto (AIC)":
+                    k = auto_select_lag(stationary_df)
+                else:
+                    k = granger_max_lag
+                st.caption(f"Using lag = **{k}**")
+                gmat = granger_matrix(stationary_df, max_lag=k, alpha=causality_alpha, fdr=True)
+                if gmat.empty or not gmat["significant"].any():
+                    st.info("No significant Granger causal relationships (FDR controlled).")
+                else:
+                    st.success("Significant (FDR-controlled) relationships:")
+                    st.dataframe(gmat[gmat["significant"]], use_container_width=True, height=300)
+                    df_download_button(gmat, "Download Granger results CSV", "granger_results.csv")
+
+                if diff_info:
+                    st.caption(f"Differencing applied (ADF α={causality_alpha}): " +
+                               ", ".join([f"{k}: d={v}" for k,v in diff_info.items()]))
+
+        # ------------- Tab 3: PC DAG -------------
+        with tab3:
+            st.header("PC Algorithm - Static Causal Graph")
+            if stationary_df.empty:
+                st.error("PC requires stationary/numeric data.")
+            else:
+                dag, stats = pc_estimate(stationary_df, alpha=causality_alpha, ci_test=ci_test)
+                fig_pc = plot_dag(dag, "Estimated DAG (PC)")
+                if fig_pc:
+                    st.pyplot(fig_pc)
+                    st.write(f"**Nodes:** {stats['num_nodes']} | **Edges:** {stats['num_edges']}")
+                    edges_df = pd.DataFrame(stats["edges"], columns=["u","v"])
+                    with st.expander("Show edges"):
+                        st.dataframe(edges_df, use_container_width=True, height=240)
+                    df_download_button(edges_df, "Download PC edges CSV", "pc_edges.csv")
+                else:
+                    st.info("Empty DAG.")
+
+        # ------------- Tab 4: DBN -------------
+        with tab4:
+            st.header("Dynamic Bayesian Network (DBN) Structure")
+            try:
+                dbn, dbn_stats = dbn_estimate(df_work, max_lag=dbn_max_lag, alpha=causality_alpha, ci_test=ci_test)
+                fig_dbn = plot_dag(dbn, f"DBN (lags up to {dbn_max_lag})")
+                if fig_dbn:
+                    st.pyplot(fig_dbn)
+                    st.write(f"**Nodes:** {dbn_stats['num_nodes']} | **Edges:** {dbn_stats['num_edges']}")
+                    dbn_edges = pd.DataFrame(dbn_stats["edges"], columns=["u","v"])
+                    with st.expander("Show edges"):
+                        st.dataframe(dbn_edges, use_container_width=True, height=240)
+                    df_download_button(dbn_edges, "Download DBN edges CSV", "dbn_edges.csv")
+                else:
+                    st.info("DBN could not be estimated.")
+            except Exception as e:
+                st.error(f"DBN error: {e}")
+
+        # ------------- Tab 5: Advanced Causal Inference -------------
+        with tab5:
+            st.header("Advanced Causal Inference")
+            st.warning("These methods require strong assumptions. Interpret results with care.")
+            left, right = st.columns([1,1])
+
+            with left:
+                framework = st.radio("Choose a Causal Framework:", ("DoWhy", "EconML + SHAP"), index=1)
+                treatment_variable = st.selectbox("Treatment (T)", options=df_work.columns)
+                outcome_variable = st.selectbox("Outcome (Y)", options=df_work.columns)
+
+                all_other = [c for c in df_work.columns if c not in [treatment_variable, outcome_variable]]
+                confounders = st.multiselect("Confounders (Z)", options=all_other, default=[])
+
+            with right:
+                st.markdown("**Optional DAG (DOT language) for DoWhy**")
+                st.info("Example: `digraph { A -> B; A -> C; B -> D; C -> D; }`")
+                dag_dot_code = st.text_area("Enter DAG in DOT language (DoWhy only):", value="", height=150)
+
+                econml_models = {
+                    "CausalForestDML": CausalForestDML,
+                    "LinearDML": LinearDML,
+                    "SparseLinearDML": SparseLinearDML,
+                    "KernelDML": KernelDML
+                }
+                econml_model_name = st.selectbox("EconML Model:", list(econml_models.keys()), index=0)
+                policy_budget = st.slider("Policy: treat top X% by predicted CATE", 1, 50, 20, 1)
+
+            run_causal = st.button("Run Causal Inference", type="primary", use_container_width=True)
+
+            if run_causal:
+                df_clean = df_work.dropna()
+                if df_clean.empty:
+                    st.error("DataFrame is empty after dropping missing values.")
+                    st.stop()
+
+                Y = df_clean[outcome_variable].values
+                T = df_clean[treatment_variable].values
+                covariates = [c for c in df_clean.columns if c not in [treatment_variable, outcome_variable]]
+
+                # Split covariates into X (heterogeneity features) vs W (controls) by user choice
+                if confounders:
+                    W = df_clean[confounders].values
+                    Xcols = [c for c in covariates if c not in confounders]
+                    X = df_clean[Xcols].values if Xcols else None
+                else:
+                    W = None
+                    Xcols = covariates
+                    X = df_clean[Xcols].values if Xcols else None
+
+                # ---------------- DoWhy path ----------------
+                if framework == "DoWhy":
+                    st.subheader("DoWhy Analysis")
+                    with st.spinner("Running DoWhy..."):
+                        try:
+                            if dag_dot_code.strip():
+                                model = CausalModel(
+                                    data=df_clean,
+                                    treatment=treatment_variable,
+                                    outcome=outcome_variable,
+                                    graph=dag_dot_code
+                                )
+                            else:
+                                model = CausalModel(
+                                    data=df_clean,
+                                    treatment=treatment_variable,
+                                    outcome=outcome_variable,
+                                    common_causes=confounders if confounders else None,
+                                )
+
+                            st.success("1) Causal Model defined.")
+                            if dag_dot_code:
+                                try:
+                                    dot_graph = pydot.graph_from_dot_data(dag_dot_code)[0]
+                                    st.graphviz_chart(dot_graph.to_string())
+                                except Exception as e:
+                                    st.warning(f"DOT visualization failed: {e}")
+
+                            identified = model.identify_effect(proceed_when_unidentifiable=True)
+                            st.success("2) Identified Estimand:")
+                            st.code(identified.estimand_expression)
+
+                            # Use EconML DML estimator underneath for robustness
+                            est = model.estimate_effect(
+                                identified,
+                                method_name="backdoor.econml.dml.DML",
+                                control_value=0,  
+                                treatment_value=1,
+                                method_params={"init_args": {
+                                    'model_y': RandomForestRegressor(random_state=GLOBAL_SEED),
+                                    'model_t': RandomForestRegressor(random_state=GLOBAL_SEED)},
+                                    "fit_args": {}}
+                            )
+                            st.success("3) Causal Estimate:")
+                            st.write(f"**Point Estimate:** {float(est.value):.4f}")
+
+                            with st.expander("4) Refutation: Random Common Cause"):
+                                ref = model.refute_estimate(identified, est, method_name="random_common_cause")
+                                st.write(f"Original: {float(est.value):.4f} | New: {float(ref.new_effect):.4f} | p={ref.p_value:.4f}")
+                        except Exception as e:
+                            st.error(f"DoWhy error: {e}")
+
+                # ---------------- EconML + SHAP path ----------------
+                else:
+                    st.subheader("EconML + SHAP (CATE Exploration)")
+                    with st.spinner("Fitting EconML estimator and computing CATE..."):
+                        try:
+                            # choose estimator
+                            Econ = econml_models[econml_model_name]
+                            model_y = RandomForestRegressor(n_estimators=300, random_state=GLOBAL_SEED)
+                            model_t = RandomForestRegressor(n_estimators=300, random_state=GLOBAL_SEED)
+
+                            # Instantiate with minimal args; allow W/X None
+                            est = Econ(model_y=model_y, model_t=model_t)
+                            est.fit(Y, T, X=X, W=W)
+
+                            # Effects
+                            if X is not None:
+                                cate = est.effect(X=X)
+                                ate = np.mean(cate)
+                                try:
+                                    lo, hi = est.effect_interval(X=X, alpha=0.05)
+                                    ci_text = f"[{np.mean(lo):.4f}, {np.mean(hi):.4f}]"
+                                except Exception:
+                                    ci_text = "N/A"
+                            else:
+                                cate = est.effect()
+                                ate = np.mean(cate) if isinstance(cate, np.ndarray) else float(cate)
+                                try:
+                                    lo, hi = est.effect_interval(alpha=0.05)
+                                    ci_text = f"[{np.mean(lo):.4f}, {np.mean(hi):.4f}]"
+                                except Exception:
+                                    ci_text = "N/A"
+
+                            st.success(f"ATE (mean CATE): **{ate:.4f}**  |  95% CI: **{ci_text}**")
+
+                            # Show CATE distribution
+                            if isinstance(cate, np.ndarray) and cate.size > 1:
+                                fig, ax = plt.subplots(figsize=(10, 5))
+                                ax.hist(cate, bins=30)
+                                ax.set_title("Distribution of individual CATE")
+                                ax.set_xlabel("CATE"); ax.set_ylabel("Count")
+                                st.pyplot(fig)
+
+                            # Build a *surrogate model* to explain CATE with SHAP
+                            if X is not None and X.shape[1] > 0:
+                                X_df = pd.DataFrame(X, columns=Xcols, index=df_clean.index)
+                                cate_series = pd.Series(np.ravel(cate), index=X_df.index, name="CATE")
+
+                                # Download CATE table
+                                cate_table = pd.concat([X_df, cate_series], axis=1)
+                                df_download_button(cate_table.reset_index(drop=True),
+                                                   "Download CATE table", "cate_table.csv")
+
+                                # Train surrogate (tree) to predict CATE from X
+                                X_tr, X_te, y_tr, y_te = train_test_split(X_df, cate_series, test_size=0.2, random_state=GLOBAL_SEED)
+                                gbrt = GradientBoostingRegressor(random_state=GLOBAL_SEED)
+                                gbrt.fit(X_tr, y_tr)
+                                r2 = gbrt.score(X_te, y_te)
+                                st.caption(f"Surrogate model (GBRT) R² on holdout: **{r2:.3f}** — quality of SHAP explanations hinges on this.")
+
+                                # SHAP summary & top features
+                                if HAS_SHAP:
+                                    explainer = shap.TreeExplainer(gbrt)
+                                    shap_values = explainer.shap_values(X_df)
+
+                                    st.subheader("SHAP Summary (CATE explanations)")
+                                    fig = plt.figure(figsize=(10, 5))
+                                    shap.summary_plot(shap_values, X_df, show=False)
+                                    st.pyplot(fig)
+
+                                    # Bar plot of mean |SHAP|
+                                    st.subheader("Feature importance for CATE (mean |SHAP|)")
+                                    imp = np.abs(shap_values).mean(axis=0)
+                                    imp_df = pd.DataFrame({"feature": X_df.columns, "mean_abs_shap": imp}) \
+                                             .sort_values("mean_abs_shap", ascending=False)
+                                    fig2, ax2 = plt.subplots(figsize=(8, 5))
+                                    ax2.barh(imp_df["feature"][::-1], imp_df["mean_abs_shap"][::-1])
+                                    ax2.set_title("Mean |SHAP|"); ax2.set_xlabel("Importance")
+                                    st.pyplot(fig2)
+                                    df_download_button(imp_df, "Download SHAP importances", "shap_importances.csv")
+
+                                    # Dependence plot for top K features
+                                    topk = st.slider("Top-K features for SHAP dependence plots", 1, min(10, len(imp_df)), min(5, len(imp_df)))
+                                    top_features = imp_df["feature"].head(topk).tolist()
+                                    st.subheader("SHAP dependence plots (CATE vs feature)")
+                                    for f in top_features:
+                                        fig3 = plt.figure(figsize=(6,4))
+                                        shap.dependence_plot(f, shap_values, X_df, show=False)
+                                        st.pyplot(fig3)
+                                else:
+                                    st.info("`shap` is not installed. Run `pip install shap` to enable SHAP-based CATE explanations.")
+
+                                # Simple *policy uplift* analysis
+                                st.subheader("Policy simulation (treat according to predicted CATE)")
+                                q = policy_budget / 100.0
+                                n = len(cate_series)
+                                k = max(1, int(q * n))
+                                top_idx = cate_series.sort_values(ascending=False).index[:k]
+                                # Expected uplift under policy: average CATE among treated subset
+                                uplift_policy = float(cate_series.loc[top_idx].mean())
+                                st.write(f"If you can treat top **{policy_budget}%** of units, expected average uplift among treated is **{uplift_policy:.4f}**.")
+                                st.caption("Note: This is a naive policy value proxy assuming no capacity spillovers and accurate CATE estimates.")
+
+                            else:
+                                st.info("No heterogeneity features (X) provided, so SHAP/CATE exploration is limited.")
+                        except Exception as e:
+                            st.error(f"EconML/SHAP error: {e}")
+
+    except Exception as e:
+        st.error(f"An error occurred while processing the file: {e}")
+
+elif uploaded_file and not run_button:
+    st.info("Click 'Run Analysis' in the sidebar to start.")
+else:
+    st.info("Please upload a CSV file and click 'Run Analysis' to get started.")
