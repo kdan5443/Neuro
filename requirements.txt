@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+networkx
+matplotlib
+seaborn
+pgmpy
+statsmodels
+econml
+scikit-learn
+dowhy
+pydot
+shap
+torch   # optional
