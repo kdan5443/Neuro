@@ -1,17 +1,17 @@
-streamlit
-pandas
-numpy
-networkx
-matplotlib
-seaborn
-pgmpy
-statsmodels
-econml
-scikit-learn
-dowhy
-pydot
-shap
-plotly
-streamlit-aggrid
-# Optional: uncomment if you want the TCN tab & your app uses it
-# torch
+streamlit==1.48.1
+pandas==2.3.1
+numpy==2.2.6
+networkx>=3.5
+matplotlib>=3.10
+seaborn>=0.13
+pgmpy==1.0.0
+statsmodels>=0.14.5
+econml==0.16.0
+scikit-learn==1.6.1
+dowhy==0.8
+pydot>=4.0.1
+shap>=0.48          # important for Python 3.13
+plotly>=6
+streamlit-aggrid>=1.1.7
+# torch            # ← remove or leave commented to avoid massive CUDA downloads
+
