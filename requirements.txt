@@ -1,5 +1,6 @@
 
 
+--index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.8.0+cpu
 
@@ -18,8 +19,10 @@ pydot==4.0.1
 shap==0.48.0
 plotly==6.3.0
 streamlit-aggrid==1.1.7
+# optional, but fine to keep:
 numba==0.61.2
 llvmlite==0.44.0
+
 
 
 
