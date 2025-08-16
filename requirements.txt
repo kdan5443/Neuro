@@ -11,4 +11,7 @@ scikit-learn
 dowhy
 pydot
 shap
-torch   # optional
+plotly
+streamlit-aggrid
+# Optional: uncomment if you want the TCN tab & your app uses it
+# torch
